@@ -1,0 +1,266 @@
+"""
+=============================================================================
+  Sentinel Swarm — ROS2 Launch File
+  Spawns N aerial_v1 drones in Gazebo disaster zone
+
+  Usage:
+    # Single drone (default)
+    ros2 launch sentinel_sim aerial_v1_spawn.launch.py
+
+    # Spawn 5 drones in formation
+    ros2 launch sentinel_sim aerial_v1_spawn.launch.py num_drones:=5
+
+    # Open RViz2 as well
+    ros2 launch sentinel_sim aerial_v1_spawn.launch.py num_drones:=3 rviz:=true
+=============================================================================
+"""
+
+import os
+import math
+from launch import LaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument, OpaqueFunction,
+    IncludeLaunchDescription, TimerAction
+)
+from launch.substitutions import LaunchConfiguration
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch_ros.actions import Node
+from ament_index_python.packages import get_package_share_directory
+
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+SIM_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+URDF_PATH = os.path.join(SIM_DIR, 'urdf', 'aerial_v1.urdf')
+WORLD_PATH = os.path.join(SIM_DIR, 'worlds', 'disaster_zone.sdf')
+
+
+def compute_spawn_positions(n: int, formation: str = 'line') -> list:
+    """
+    Computes spawn positions for N drones.
+
+    Formations:
+      'line'    — drones spawn in a horizontal line, 3m apart
+      'grid'    — drones spawn in a square grid, 5m apart
+      'circle'  — drones spawn on a circle with at least 3m separation
+    """
+    limits = {'line': 10, 'grid': 100, 'circle': 28}
+    if formation not in limits:
+        raise ValueError(f"Unknown formation '{formation}'; choose line, grid, or circle")
+    if n < 1 or n > limits[formation]:
+        raise ValueError(
+            f"{formation} formation supports 1..{limits[formation]} drones "
+            "inside the 30 x 30 m operating area"
+        )
+
+    positions = []
+
+    if formation == 'line':
+        for i in range(n):
+            positions.append({
+                'x': -((n - 1) * 1.5) + i * 3.0,
+                'y': 0.0,
+                'z': 0.1,       # spawn on ground
+                'yaw': 0.0,
+            })
+
+    elif formation == 'grid':
+        cols = math.ceil(math.sqrt(n))
+        rows = math.ceil(n / cols)
+        # Keep even large demo grids inside the 30 x 30 m operating area.
+        spacing = min(5.0, 27.0 / max(cols - 1, rows - 1, 1))
+        for i in range(n):
+            row = i // cols
+            col = i %  cols
+            positions.append({
+                'x': col * spacing - (cols - 1) * spacing / 2,
+                'y': row * spacing - (rows - 1) * spacing / 2,
+                'z': 0.1,
+                'yaw': 0.0,
+            })
+
+    elif formation == 'circle':
+        min_radius_for_spacing = 3.0 / (2.0 * math.sin(math.pi / n)) if n > 2 else 0.0
+        radius = max(4.0, min_radius_for_spacing)
+        for i in range(n):
+            angle = (2 * math.pi / n) * i
+            positions.append({
+                'x': radius * math.cos(angle),
+                'y': radius * math.sin(angle),
+                'z': 0.1,
+                'yaw': angle + math.pi,   # Face inward
+            })
+
+    return positions
+
+
+def launch_setup(context, *args, **kwargs):
+    """OpaqueFunction that reads launch args and builds the node list."""
+
+    num_drones  = int(LaunchConfiguration('num_drones').perform(context))
+    formation   = LaunchConfiguration('formation').perform(context)
+    rviz_flag   = LaunchConfiguration('rviz').perform(context).lower() == 'true'
+    world_path  = LaunchConfiguration('world').perform(context)
+
+    nodes = []
+
+    # ── 1. Gazebo Simulator ────────────────────────────────────────────────
+    nodes.append(
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                os.path.join(
+                    get_package_share_directory('ros_gz_sim'),
+                    'launch', 'gz_sim.launch.py'
+                )
+            ),
+            launch_arguments={
+                'gz_args': f'-r {world_path}',
+                'on_exit_shutdown': 'true',
+            }.items(),
+        )
+    )
+
+    # ── 2. Spawn each drone with a unique namespace ────────────────────────
+    positions = compute_spawn_positions(num_drones, formation)
+
+    # Read URDF once
+    with open(URDF_PATH, 'r') as f:
+        urdf_content = f.read()
+
+    for i, pos in enumerate(positions):
+        drone_id  = f'sentinel_{i+1:02d}'
+        namespace = f'/sentinel/{drone_id}'
+
+        # Replace template markers
+        drone_urdf = urdf_content.replace('__DRONE_ID__', drone_id)
+
+        # Robot State Publisher (one per drone)
+        nodes.append(
+            Node(
+                package    = 'robot_state_publisher',
+                executable = 'robot_state_publisher',
+                namespace  = namespace,
+                name       = 'rsp',
+                parameters = [{'robot_description': drone_urdf,
+                               'use_sim_time': True,
+                               'frame_prefix': f'{drone_id}/'}],
+                output     = 'screen',
+            )
+        )
+
+        # Joint State Publisher (provides 0.0 default for continuous joints to satisfy RViz)
+        nodes.append(
+            Node(
+                package    = 'joint_state_publisher',
+                executable = 'joint_state_publisher',
+                namespace  = namespace,
+                name       = 'jsp',
+                parameters = [{'robot_description': drone_urdf, 'use_sim_time': True}],
+                output     = 'screen',
+            )
+        )
+
+        # Spawn entity in Gazebo (staggered by 0.5s each to avoid physics explosions)
+        nodes.append(
+            TimerAction(
+                period = float(i) * 0.5,
+                actions = [
+                    Node(
+                        package    = 'ros_gz_sim',
+                        executable = 'create',
+                        arguments  = [
+                            '-name',  drone_id,
+                            '-topic', f'{namespace}/robot_description',
+                            '-x',     str(pos['x']),
+                            '-y',     str(pos['y']),
+                            '-z',     str(pos['z']),
+                            '-Y',     str(pos['yaw']),
+                        ],
+                        output = 'screen',
+                    )
+                ]
+            )
+        )
+
+        # ROS ↔ Gazebo Bridge (IMU + Camera per drone)
+        nodes.append(
+            Node(
+                package    = 'ros_gz_bridge',
+                executable = 'parameter_bridge',
+                namespace  = namespace,
+                name       = f'gz_bridge_{drone_id}',
+                arguments  = [
+                    f'/{drone_id}/imu@sensor_msgs/msg/Imu[gz.msgs.IMU',
+                    f'/{drone_id}/camera/image_raw@sensor_msgs/msg/Image[gz.msgs.Image',
+                    f'/{drone_id}/lidar/scan@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan',
+                    f'/{drone_id}/gazebo/command/twist@geometry_msgs/msg/Twist]gz.msgs.Twist',
+                    f'/{drone_id}/enable@std_msgs/msg/Bool]gz.msgs.Boolean',
+                    f'/model/{drone_id}/pose@geometry_msgs/msg/PoseStamped[gz.msgs.Pose',
+                ],
+                output = 'screen',
+            )
+        )
+
+        # Flight Bridge Node
+        nodes.append(
+            Node(
+                package    = 'sentinel_sim',
+                executable = 'sim_flight_bridge.py',
+                namespace  = namespace,
+                name       = f'sim_flight_bridge_{drone_id}',
+                parameters = [{'robot_description': drone_urdf, 'use_sim_time': True}],
+                arguments  = ['--drone-id', drone_id, '--drone-index', str(i), '--num-drones', str(num_drones)],
+                output     = 'screen'
+            )
+        )
+
+    # ── 4. Optional RViz2 ──────────────────────────────────────────────────
+    if rviz_flag:
+        rviz_config = os.path.join(SIM_DIR, 'config', 'sentinel_rviz.rviz')
+        nodes.append(
+            Node(
+                package    = 'rviz2',
+                executable = 'rviz2',
+                name       = 'rviz2',
+                arguments  = ['-d', rviz_config] if os.path.exists(rviz_config) else [],
+                parameters = [{'robot_description': drone_urdf, 'use_sim_time': True}],
+                output     = 'screen',
+            )
+        )
+
+    # Global clock bridge
+    nodes.append(
+        Node(
+            package    = 'ros_gz_bridge',
+            executable = 'parameter_bridge',
+            name       = 'gz_bridge_clock',
+            arguments  = ['/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock'],
+            output     = 'screen'
+        )
+    )
+
+    return nodes
+
+
+def generate_launch_description():
+    return LaunchDescription([
+        # ── Launch Arguments ───────────────────────────────────────────────
+        DeclareLaunchArgument(
+            'num_drones', default_value='1',
+            description='Drone count; capacity depends on formation (up to 100 in grid)'
+        ),
+        DeclareLaunchArgument(
+            'formation', default_value='line',
+            description='Spawn formation: line (1-10), grid (1-100), or circle (1-28)'
+        ),
+        DeclareLaunchArgument(
+            'rviz', default_value='false',
+            description='Launch RViz2 alongside Gazebo'
+        ),
+        DeclareLaunchArgument(
+            'world', default_value=WORLD_PATH,
+            description='Path to Gazebo world SDF file'
+        ),
+
+        # ── Dynamic setup ──────────────────────────────────────────────────
+        OpaqueFunction(function=launch_setup),
+    ])
