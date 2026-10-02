@@ -13,7 +13,7 @@ The entire physical architecture is also backed by a highly accurate **Gazebo Ha
 flowchart TD
     subgraph AERIAL["Aerial Node v2 (Raspberry Pi 5 + ESP32-S31 FC)"]
         direction TB
-        CAM["USB Webcam\n1280×720 30fps"] --> SLAM["Monocular SLAM\nEKF 9-state\n+ RRT* Planner"]
+        CAM["USB Webcam\n1138×640 30fps"] --> SLAM["Monocular SLAM\nEKF 9-state\n+ RRT* Planner"]
         IMU_HW["MPU6050 IMU\n800Hz Mahony AHRS"] --> SLAM
         CAM --> VISION["YOLO11n NCNN\nCasualty Detection\nFP16 CPU"]
         THERMAL["(Thermal — future)"] --> VISION
@@ -113,7 +113,7 @@ Sentinel Swarm/
 | Flight Controller | ESP32-S31 | 800Hz FreeRTOS, custom firmware |
 | Companion | Raspberry Pi 5 8GB | SLAM + YOLO + Swarm |
 | IMU | MPU6050 | Mahony AHRS, 1kHz |
-| Camera | USB Webcam | 1280×720 30fps, monocular SLAM |
+| Camera | USB Webcam | 1138×640 30fps, monocular SLAM |
 | Radio | LoRa SX1262 | 868MHz mesh, swarm coordination |
 | Battery | 4S 3300mAh LiPo | ~290g, below-frame mount |
 | Motors | 2306 brushless | 4× BLHeli ESC |
