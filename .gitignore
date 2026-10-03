@@ -50,3 +50,20 @@ bin/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+*.code-workspace
+
+# Temp / scratch
+*.tmp
+*.bak
+*.orig
+scratch/
+tmp/

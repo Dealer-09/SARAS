@@ -181,7 +181,7 @@ def launch_setup(context, *args, **kwargs):
             )
         )
 
-        # ROS ↔ Gazebo Bridge (IMU + Camera per drone)
+        # ROS ↔ Gazebo Bridge (IMU + Camera + Thermal + LiDAR per drone)
         nodes.append(
             Node(
                 package    = 'ros_gz_bridge',
@@ -191,6 +191,7 @@ def launch_setup(context, *args, **kwargs):
                 arguments  = [
                     f'/{drone_id}/imu@sensor_msgs/msg/Imu[gz.msgs.IMU',
                     f'/{drone_id}/camera/image_raw@sensor_msgs/msg/Image[gz.msgs.Image',
+                    f'/{drone_id}/camera/thermal@sensor_msgs/msg/Image[gz.msgs.Image',
                     f'/{drone_id}/lidar/scan@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan',
                     f'/{drone_id}/gazebo/command/twist@geometry_msgs/msg/Twist]gz.msgs.Twist',
                     f'/{drone_id}/enable@std_msgs/msg/Bool]gz.msgs.Boolean',

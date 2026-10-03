@@ -291,9 +291,10 @@ class SimFlightBridge(Node):
     def _peer_state_callback(self, msg: String):
         try:
             state = DroneState.from_json(msg.data)
-            # Inject directly into the swarm transport's peer table
+            # Inject directly into the swarm transport's peer table (thread-safe)
             if hasattr(self.swarm, 'transport') and self.swarm.transport:
-                self.swarm.transport.peers[state.drone_id] = state
+                with self.swarm.transport._lock:
+                    self.swarm.transport.peers[state.drone_id] = state
         except Exception:
             pass
 
@@ -347,9 +348,13 @@ class SimFlightBridge(Node):
     # Broadcast own state to peers at 2Hz
     # ─────────────────────────────────────────────────────────────────────────
     def _broadcast_state(self):
-        role = (DroneRole.RTB if self.phase == PHASE_RTB else
-                DroneRole.RESCUING if self.phase in (PHASE_RESCUE, PHASE_HOVER)
-                else DroneRole.SEARCHING)
+        # A landed drone (HOVER but not armed) should be considered RTB/IDLE
+        if not self.armed and self.phase == PHASE_HOVER:
+            role = DroneRole.RTB
+        else:
+            role = (DroneRole.RTB if self.phase == PHASE_RTB else
+                    DroneRole.RESCUING if self.phase in (PHASE_RESCUE, PHASE_HOVER)
+                    else DroneRole.SEARCHING)
         state = DroneState(
             drone_id      = self.drone_id,
             role          = role,
@@ -426,6 +431,7 @@ class SimFlightBridge(Node):
                 if self._should_handle_casualty(self.casualty_xyz, peers):
                     self._request_path(np.array([*self.casualty_xyz[:2], 3.0]))
                     self.phase = PHASE_RESCUE
+                    self._broadcast_state()
                     self.get_logger().warn(
                         f'[{self.drone_id}] Taking rescue assignment for report '
                         f'from {report.drone_id}'
@@ -441,6 +447,10 @@ class SimFlightBridge(Node):
             self._run_rescue(cmd)
 
         elif self.phase == PHASE_HOVER:
+            # If armed and hovering, we are over the casualty. Ensure we haven't
+            # been superseded by a higher priority drone due to network lag.
+            if self.armed and self.casualty_xyz is not None:
+                self._resolve_rescue_conflict(self.casualty_xyz)
             pass  # hold position — cmd stays zero
 
         elif self.phase == PHASE_RTB:
@@ -503,6 +513,7 @@ class SimFlightBridge(Node):
         return np.array([p.x, p.y, p.z])
 
     # ─────────────────────────────────────────────────────────────────────────
+
     # Phase logic
     # ─────────────────────────────────────────────────────────────────────────
     def _arm(self):
@@ -560,6 +571,9 @@ class SimFlightBridge(Node):
         if self.casualty_visible and image_fresh and pos[2] > 1.5:
             self.casualty_found = True
             self.casualty_xyz   = CASUALTY_XYZ.copy()
+            # Only enter RESCUE if not already in it (prevents re-triggering)
+            if self.phase == PHASE_RESCUE:
+                return
             peers = self.swarm.transport.get_live_peers()
             if self._should_handle_casualty(self.casualty_xyz, peers):
                 self.get_logger().warn(
@@ -568,10 +582,40 @@ class SimFlightBridge(Node):
                 )
                 self._request_path(np.array([CASUALTY_XYZ[0], CASUALTY_XYZ[1], 3.0]))
                 self.phase = PHASE_RESCUE
+                # Immediately broadcast updated role so peers see RESCUING fast
+                self._broadcast_state()
+            else:
+                # A peer is already handling this — log once and stay in SEARCH
+                self.get_logger().info(
+                    f'[{self.drone_id}] 📡 Casualty seen but peer already rescuing — '
+                    f'continuing search'
+                )
+
+
+    def _resolve_rescue_conflict(self, casualty_xyz: np.ndarray) -> bool:
+        """Yields to a lower-ID peer if both are rescuing the same casualty."""
+        peers = self.swarm.transport.get_live_peers()
+        other_rescuers = [p.drone_id for p in peers.values() if p.role == DroneRole.RESCUING 
+                          and p.casualty_xyz is not None 
+                          and np.linalg.norm(p.casualty_xyz[:2] - casualty_xyz[:2]) < 2.0]
+        if other_rescuers:
+            lowest_id = min(other_rescuers + [self.drone_id])
+            if self.drone_id != lowest_id:
+                self.get_logger().warn(f"[{self.drone_id}] Conflict: Yielding rescue to {lowest_id} (tie-breaker)")
+                self.phase = PHASE_SEARCH
+                self.slam.path_to_target = []
+                self._broadcast_state()
+                return True
+        return False
 
     def _run_rescue(self, cmd: Twist):
         """Fly to casualty location and hold a 3m hover directly above."""
         casualty_xyz = self.casualty_xyz if self.casualty_xyz is not None else CASUALTY_XYZ
+
+        # Deterministic conflict resolution for split-brain assignments
+        if self._resolve_rescue_conflict(casualty_xyz):
+            return
+
         target = np.array([casualty_xyz[0], casualty_xyz[1], 3.0])
         pos    = self._get_current_pos()
         diff   = target - pos

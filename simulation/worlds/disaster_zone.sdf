@@ -37,6 +37,24 @@
     <plugin filename="gz-sim-user-commands-system"  name="gz::sim::systems::UserCommands"/>
     <plugin filename="gz-sim-imu-system"            name="gz::sim::systems::Imu"/>
     <plugin filename="gz-sim-contact-system"        name="gz::sim::systems::Contact"/>
+    <!-- Wind & Turbulence — models post-collapse dust thermals and crosswinds -->
+    <plugin filename="gz-sim-wind-effects-system"   name="gz::sim::systems::WindEffects">
+      <!-- Steady mean wind: 2 m/s from the North-West (disaster smoke drift) -->
+      <horizontal_mean_velocity>1.4 1.4 0</horizontal_mean_velocity>
+      <!-- Turbulence: random Gaussian gusts around the mean -->
+      <horizontal_mean_standard_deviation>0.6 0.6 0</horizontal_mean_standard_deviation>
+      <!-- Vertical component: gentle updraft around the rubble piles -->
+      <vertical_mean_velocity>0 0 0.2</vertical_mean_velocity>
+      <vertical_mean_standard_deviation>0 0 0.15</vertical_mean_standard_deviation>
+    </plugin>
+
+    <!-- Ambient air temperature: 303 K (30°C) — hot summer disaster scenario -->
+    <!-- Casualty body temp set to 310 K (37°C) in models below for contrast  -->
+    <atmosphere type="adiabatic">
+      <temperature>303.15</temperature>
+      <pressure>101325</pressure>
+      <temperature_gradient>-0.0065</temperature_gradient>
+    </atmosphere>
 
     <!-- ── Lighting ──────────────────────────────────────────────────────── -->
     <light name="sun" type="directional">
@@ -195,10 +213,11 @@
          Position: partially obscured behind rubble pile
     ═══════════════════════════════════════════════════════════════════════ -->
 
-    <!-- Torso -->
+    <!-- Torso — 37°C body heat (310.15 K) for thermal camera detection -->
     <model name="casualty_torso">
       <static>true</static>
       <pose>-0.5 -9 0.15 1.5708 0 0.4</pose>
+      <temperature>310.15</temperature>  <!-- 37°C human body core temp in Kelvin -->
       <link name="link">
         <collision name="col"><geometry><box><size>0.50 0.30 0.20</size></box></geometry></collision>
         <visual name="vis">
@@ -208,10 +227,11 @@
       </link>
     </model>
 
-    <!-- Head -->
+    <!-- Head — 38°C (face/forehead slightly warmer exposed skin) -->
     <model name="casualty_head">
       <static>true</static>
       <pose>-0.1 -9.5 0.18 0 0 0</pose>
+      <temperature>311.15</temperature>  <!-- 38°C — exposed forehead slightly warmer -->
       <link name="link">
         <collision name="col"><geometry><sphere><radius>0.10</radius></sphere></geometry></collision>
         <visual name="vis">
@@ -221,10 +241,11 @@
       </link>
     </model>
 
-    <!-- Legs -->
+    <!-- Legs — 36°C (extremities slightly cooler than core body) -->
     <model name="casualty_legs">
       <static>true</static>
       <pose>-1.0 -8.5 0.10 1.5708 0 0.4</pose>
+      <temperature>309.15</temperature>  <!-- 36°C — extremities slightly cooler -->
       <link name="link">
         <collision name="col"><geometry><box><size>0.20 0.55 0.18</size></box></geometry></collision>
         <visual name="vis">
@@ -233,6 +254,8 @@
         </visual>
       </link>
     </model>
+
+
 
 
     <!-- ═══════════════════════════════════════════════════════════════════
