@@ -90,8 +90,10 @@ log = logging.getLogger(__name__)
 # =============================================================================
 
 # Hardware ports
-FC_SERIAL_PORT   = '/dev/ttyACM0'      # FC connected via USB Type-C      # Pi GPIO14/15 → FC UART1
-FC_BAUD_RATE     = 115200              # Standard baud for ArduPilot USB (MAVLink)              # Must match SERIAL1_BAUD=921 in ArduPilot
+# USB-C connection (SERIAL0 on MicoAir H743 V2 → /dev/ttyACM0 @ 115200)
+# GPIO UART alternative: /dev/serial0 @ 921600 via UART1 (SERIAL1)
+FC_SERIAL_PORT   = '/dev/ttyACM0'      # USB-C → SERIAL0; change to /dev/serial0 for GPIO UART
+FC_BAUD_RATE     = 115200              # 115200 for USB; 921600 for GPIO UART (SERIAL1_BAUD=921)
 XBEE_PORT        = '/dev/ttyUSB0'      # USB XBee module
 CAMERA_DEVICE    = 0                   # /dev/video0
 
@@ -160,13 +162,19 @@ class FCInterface:
         self._armed        = False
         self._mode         = "STABILIZE"
         self._alt_rel      = 0.0          # relative altitude from FC baro (m)
-        self._battery_pct  = 100.0
+        # -1.0 = unknown. Stays -1 until BATTERY_STATUS or SYS_STATUS arrives.
+        # Never initialize to 100.0 — that silently disables the RTB trigger
+        # if the stream never arrives.
+        self._battery_pct  = -1.0
         self._home_lat     = 0.0
         self._home_lon     = 0.0
         self._home_set     = False
         self._gps_fix      = 0
         self._lock         = threading.Lock()
-        self._last_hb_time = time.time()
+        # Initialize to 0 (epoch), NOT time.time(). If we set it to now,
+        # link_alive returns True for 3s even with no FC connected — masking
+        # a dead/unplugged FC entirely. Only set after real heartbeat arrives.
+        self._last_hb_time = 0.0
 
         if sim_mode:
             log.info("[FC] SIM MODE — no real FC connection")
@@ -190,6 +198,11 @@ class FCInterface:
             log.info(f"[FC] ✅ Heartbeat received — FC is alive "
                      f"(system={self._mav.target_system}, "
                      f"component={self._mav.target_component})")
+            # Request telemetry streams explicitly.
+            # ArduPilot does NOT stream over USB by default unless SR0_* params
+            # are pre-configured in Mission Planner. We request here to be safe.
+            # See: https://ardupilot.org/dev/docs/mavlink-requesting-data.html
+            self._request_streams()
         except Exception as e:
             log.error(f"[FC] Connection failed: {e}")
             self._mav = None
@@ -231,6 +244,39 @@ class FCInterface:
         return self._home_set
 
     # ── MAVLink Commands ──────────────────────────────────────────────────────
+
+    def _request_streams(self):
+        """
+        Explicitly request telemetry stream groups from ArduPilot.
+
+        ArduPilot (on MicoAir H743 V2 over USB/SERIAL0) does NOT send
+        GLOBAL_POSITION_INT, GPS_RAW_INT, or BATTERY_STATUS by default
+        unless the SR0_* parameters are set in Mission Planner.
+
+        Stream groups used (from ArduPilot docs):
+          MAV_DATA_STREAM_EXTENDED_STATUS (2) → GPS_RAW_INT, SYS_STATUS
+          MAV_DATA_STREAM_POSITION        (6) → GLOBAL_POSITION_INT
+          MAV_DATA_STREAM_EXTRA3          (11)→ BATTERY_STATUS, EKF_STATUS
+
+        Ref: https://ardupilot.org/dev/docs/mavlink-requesting-data.html
+        """
+        if not self._mav:
+            return
+        streams = [
+            (mavutil.mavlink.MAV_DATA_STREAM_EXTENDED_STATUS, 5),  # GPS_RAW_INT, SYS_STATUS
+            (mavutil.mavlink.MAV_DATA_STREAM_POSITION,        5),  # GLOBAL_POSITION_INT
+            (mavutil.mavlink.MAV_DATA_STREAM_EXTRA1,          10), # ATTITUDE
+            (mavutil.mavlink.MAV_DATA_STREAM_EXTRA3,          2),  # BATTERY_STATUS
+        ]
+        for stream_id, rate_hz in streams:
+            self._mav.mav.request_data_stream_send(
+                self._mav.target_system,
+                self._mav.target_component,
+                stream_id,
+                rate_hz,
+                1  # start=1
+            )
+        log.info("[FC] Telemetry stream rates requested")
 
     def set_mode(self, mode: str):
         """Set ArduPilot flight mode (e.g. 'GUIDED', 'LOITER', 'RTL')."""
@@ -318,8 +364,15 @@ class FCInterface:
             self._mav.target_system,
             self._mav.target_component,
             mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-            # Type mask: ignore position + acceleration, USE velocity only
-            0b0000_111111000111,
+            # Type mask — 0=use, 1=ignore. Velocity-only:
+            #   ignore pos  (bits 0,1,2)  = 0b000000000111
+            #   USE vel     (bits 3,4,5)  = 0b000000000000  (cleared)
+            #   ignore accel(bits 6,7,8)  = 0b000111000000
+            #   ignore yaw  (bit 10)      = 0b010000000000
+            #   ignore yawrt(bit 11)      = 0b100000000000
+            # = 0b110111000111 = 0x0DC7 = 3527
+            # Confirmed: https://ardupilot.org/dev/docs/copter-commands-in-guided-mode.html
+            0b110111000111,
             0, 0, 0,              # x, y, z position (ignored)
             vx, vy, vz,           # velocity NED (m/s)
             0, 0, 0,              # acceleration (ignored)
@@ -375,13 +428,28 @@ class FCInterface:
                         self._battery_pct = float(msg.battery_remaining)
 
                 elif msg_type == 'SYS_STATUS':
-                    # Fallback battery from SYS_STATUS if BATTERY_STATUS not sent
-                    if self._battery_pct == 100.0 and msg.battery_remaining >= 0:
+                    # Fallback: use SYS_STATUS only when BATTERY_STATUS has
+                    # never arrived (battery_pct == -1.0). Once BATTERY_STATUS
+                    # starts flowing, SYS_STATUS is ignored for battery.
+                    if self._battery_pct < 0 and msg.battery_remaining >= 0:
                         self._battery_pct = float(msg.battery_remaining)
 
             except Exception as e:
                 log.error(f"[FC] Telemetry error: {e}")
                 time.sleep(0.1)
+
+
+# =============================================================================
+# MJPEG Debug Stream Server — defined here so VisionEngine can reference
+# stream_state during inference. The HTTP server thread is started at module
+# load time (bottom of file), but the state object must exist first.
+# =============================================================================
+class StreamState:
+    def __init__(self):
+        self.frame = None
+        self.lock = threading.Lock()
+
+stream_state = StreamState()
 
 
 # =============================================================================
@@ -584,6 +652,9 @@ class DroneController:
         self._casualty_pos  = None        # (norm_cx, norm_cy) when found
         self._hover_start   = None        # timestamp when hover started
         self._last_xbee_tx  = 0.0
+        self._wp_timer      = None        # initialized here, not lazily in hot loop
+        self._disarmed_log_t = 0.0        # rate-limit DISARMED state log spam
+        self._arm_sent_t    = None        # timestamp when arm command was sent
 
         log.info("=" * 60)
         log.info("  Sentinel Swarm — Drone Companion Computer")
@@ -654,12 +725,28 @@ class DroneController:
 
         # ── DISARMED ──────────────────────────────────────────────────────────
         if state == DroneState.DISARMED:
-            log.info(f"[DISARMED] GPS fix={self.fc.gps_fix} "
-                     f"batt={batt:.0f}% armed={self.fc.armed}")
-            if self.fc.gps_fix >= 3:
+            # Rate-limit log to 1Hz to avoid 10Hz log spam
+            now = time.time()
+            if now - self._disarmed_log_t >= 1.0:
+                batt_str = f"{batt:.0f}%" if batt >= 0 else "unknown"
+                log.info(f"[DISARMED] GPS fix={self.fc.gps_fix} "
+                         f"batt={batt_str} armed={self.fc.armed}")
+                self._disarmed_log_t = now
+
+            # Warn clearly if battery telemetry not yet received
+            if batt < 0:
+                log.warning("[DISARMED] Battery telemetry not received yet — "
+                            "check SR0_EXTRA3 stream rate in Mission Planner")
+
+            # Arm when GPS fix is 3D. For GPS-denied indoor flight:
+            #   set GPS_TYPE=0, EK3_SRC1_POSXY=0, ARMING_CHECK to skip GPS bit
+            # then pass --no-gps flag to bypass this check.
+            gps_ok = self.fc.gps_fix >= 3 or getattr(self.args, 'no_gps', False)
+            if gps_ok:
                 self.fc.set_mode('GUIDED')
                 time.sleep(1.0)
                 self.fc.arm()
+                self._arm_sent_t = time.time()
                 return DroneState.ARMED
             return DroneState.DISARMED
 
@@ -669,14 +756,30 @@ class DroneController:
                 time.sleep(2.0)  # Wait for ESCs to spin up
                 self.fc.takeoff(self.args.alt)
                 return DroneState.TAKEOFF
+            # Arm rejection guard: if FC hasn't confirmed armed within 5s,
+            # the arm command was rejected (safety switch, pre-arm check fail).
+            # Go back to DISARMED so the issue gets logged and retried.
+            if self._arm_sent_t and (time.time() - self._arm_sent_t) > 5.0:
+                log.error("[ARMED] FC did not confirm arm after 5s — "
+                          "check pre-arm failures in Mission Planner. "
+                          "For GPS-denied flight set ARMING_CHECK=0 and use --no-gps flag.")
+                self._arm_sent_t = None
+                return DroneState.DISARMED
             return DroneState.ARMED
 
         # ── TAKEOFF ───────────────────────────────────────────────────────────
         elif state == DroneState.TAKEOFF:
             log.info(f"[TAKEOFF] Alt={alt:.1f}m / {self.args.alt}m")
-            if alt >= self.args.alt * 0.9:
+            # Guard: if altitude has never been updated (GLOBAL_POSITION_INT
+            # stream not flowing), alt stays 0.0 and we'd advance immediately.
+            # Require alt > 0.3m as a sanity minimum before trusting the reading.
+            if alt >= self.args.alt * 0.9 and alt > 0.3:
                 self._wp_index = 0
                 return DroneState.SEARCHING
+            elif alt == 0.0:
+                log.warning("[TAKEOFF] Altitude reading is 0.0m — "
+                            "GLOBAL_POSITION_INT stream may not be flowing. "
+                            "Check SR0_POSITION rate in Mission Planner.")
             return DroneState.TAKEOFF
 
         # ── SEARCHING ─────────────────────────────────────────────────────────
@@ -696,6 +799,9 @@ class DroneController:
                 if peer_best and peer_best['cf'] > 0.7:
                     log.info(f"[SEARCHING] Ground bot has target cf={peer_best['cf']:.2f}"
                              f" — pivoting to investigate")
+                    # Store peer's normalized position as casualty hint so
+                    # TRACKING has a starting point even before own camera sees it.
+                    self._casualty_pos = (peer_best['cx'], peer_best['cy'])
                     return DroneState.TRACKING
 
             # Fly lawnmower pattern
@@ -741,7 +847,13 @@ class DroneController:
         # ── RELAYING ──────────────────────────────────────────────────────────
         elif state == DroneState.RELAYING:
             self.fc.hover()
-            elapsed = time.time() - (self._hover_start or time.time())
+            # Guard: if we somehow entered RELAYING without _hover_start being
+            # set (e.g. direct transition bug), set it now. Without this,
+            # elapsed stays 0 every tick and the drone hovers until battery dies.
+            if self._hover_start is None:
+                log.warning("[RELAYING] hover_start was None — setting now")
+                self._hover_start = time.time()
+            elapsed = time.time() - self._hover_start
 
             # Broadcast GPS coords of casualty to ground bots
             if det.detected:
@@ -760,8 +872,11 @@ class DroneController:
         elif state == DroneState.RTB:
             log.info(f"[RTB] Battery={batt:.0f}% — returning to launch")
             self.fc.rtl()
-            # Wait until altitude drops (FC is handling return)
-            if alt < 0.5 and self.fc.armed:
+            # ArduPilot auto-disarms after RTL touchdown, so by the time
+            # alt < 0.5m the FC has already set armed=False. The original
+            # check (alt < 0.5 AND armed) is a race that never wins.
+            # Correct condition: landed = low altitude OR already disarmed.
+            if alt < 0.5 or not self.fc.armed:
                 return DroneState.LANDING
             return DroneState.RTB
 
@@ -801,7 +916,8 @@ class DroneController:
         self.fc.send_velocity_ned(vx, vy, vz)
 
         # Advance waypoint every 5 seconds (approximate)
-        if not hasattr(self, '_wp_timer'):
+        # _wp_timer is initialized in __init__, not lazily here
+        if self._wp_timer is None:
             self._wp_timer = time.time()
         if time.time() - self._wp_timer > 5.0:
             self._wp_index = (self._wp_index + 1) % len(SEARCH_PATTERN)
@@ -819,6 +935,9 @@ def main():
                         help='Simulation mode — no real FC connection')
     parser.add_argument('--no-xbee', action='store_true',
                         help='Disable XBee (solo mode, no swarm comms)')
+    parser.add_argument('--no-gps',  action='store_true',
+                        help='Skip GPS fix requirement for arming (indoor/GPS-denied flight). '
+                             'Requires FC params: GPS_TYPE=0, EK3_SRC1_POSXY=0, ARMING_CHECK=0')
     parser.add_argument('--alt',     type=float, default=CRUISE_ALT,
                         help=f'Cruise altitude in metres (default: {CRUISE_ALT})')
     parser.add_argument('--verbose', action='store_true',
@@ -843,14 +962,9 @@ if __name__ == '__main__':
 
 
 # =============================================================================
-# MJPEG Debug Stream Server
+# MJPEG Debug Stream Server — HTTP handler and server thread
+# (StreamState and stream_state are defined above VisionEngine)
 # =============================================================================
-class StreamState:
-    def __init__(self):
-        self.frame = None
-        self.lock = threading.Lock()
-
-stream_state = StreamState()
 
 class StreamingHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
